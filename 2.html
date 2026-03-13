@@ -2940,6 +2940,7 @@ body.group-chat-active #call-logs-container { display: none !important; }
   streams: {},        // email -> MediaStream
   participants: [],   // from backend
   isHost: false,
+  isStarting: false,
   isMuted: false,
   isVideoOff: false,
   isSpeakerOn: true,
@@ -4172,7 +4173,7 @@ function initCallSystem() {
     peer.on('connection', (conn) => {
         conn.on('data', (data) => {
             const msg = JSON.parse(data);
-            if (gcall.callId || gcall.incomingCallData) return;
+            if (gcall.callId || gcall.incomingCallData || gcall.isStarting) return;
 
             if (callState.callEnded) return;
 
@@ -6723,46 +6724,58 @@ async function saveGroupEdit() {
      // START CALL
 // ═══════════════════════════════════════════════════
 async function startGroupCall(callType = 'video') {
-  if (!activeGroupId) { showAlert('Error','Open a group first'); return; }
-  if (gcall.callId) { showAlert('Already in call','You are already in a group call'); return; }
+  if (!activeGroupId) { showAlert('Error', 'Open a group first'); return; }
+  if (gcall.callId) { showAlert('Already in call', 'You are already in a group call'); return; }
+
+  // ✅ Set isStarting immediately to block individual call handler
+  gcall.isStarting = true;
 
   gcall.callType = callType;
   gcall.groupId = activeGroupId;
   gcall.groupName = activeGroupData?.name || 'Group';
 
-  // Get media
   try {
     gcall.localStream = await navigator.mediaDevices.getUserMedia({
       video: callType === 'video',
       audio: true
     });
   } catch (err) {
-    showAlert('Permission Error','Could not access camera/microphone. Check permissions.','fa-exclamation-triangle text-red-400');
+    showAlert('Permission Error', 'Could not access camera/microphone. Check permissions.', 'fa-exclamation-triangle text-red-400');
+    gcall.isStarting = false;
     performGCallCleanup();
     return;
   }
 
-  // Setup PeerJS (reuse or create)
   await setupGCallPeer();
 
-  // Init call on backend
   const res = await apiRequest('initGroupCall', {
     groupId: gcall.groupId,
     callType: callType,
     peerId: gcall.myPeerId
   });
 
-  if (!res.success) { showAlert('Error', res.error || 'Could not start call'); stopLocalStream(); return; }
+  if (!res.success) {
+    showAlert('Error', res.error || 'Could not start call');
+    gcall.isStarting = false;
+    stopGCallLocalStream();
+    return;
+  }
 
   gcall.callId = res.callId;
   gcall.isHost = true;
 
-  // If call already existed, join others
   if (!res.isNew && res.participants) {
+    // ✅ Mark all as pending before WebRTC connects
+    res.participants.forEach(p => {
+      if (!gcall.participants.find(x => x.email === p.email)) {
+        gcall.participants.push({ ...p, connected: false });
+      }
+    });
     connectToExistingParticipants(res.participants);
   }
 
-  showGroupCallUI();
+  showGroupCallUI(); // ✅ clears individual call UI inside
+  gcall.isStarting = false; // ✅ safe to clear after UI is up
   startCallTimer();
   startPolling();
   gcallShowToast(`${callType === 'video' ? '📹' : '🎤'} ${callType} call started`);
@@ -6893,45 +6906,69 @@ function setupGCallPeerListeners() {
   if (!gcallPeer) return;
 
   gcallPeer.on('call', (incomingCall) => {
-    if (!gcall.callId || !gcall.localStream) return;
+  // ✅ Must have an active group call AND a local stream
+  if (!gcall.callId || !gcall.localStream) {
+    incomingCall.close();
+    return;
+  }
 
-    incomingCall.answer(gcall.localStream);
+  incomingCall.answer(gcall.localStream);
 
-    // Resolve email from peerId
-    const participant = gcall.participants.find(p => p.peerId === incomingCall.peer);
-    const callerEmail = participant?.email || incomingCall.peer;
+  // Resolve email from peerId
+  const participant = gcall.participants.find(p => p.peerId === incomingCall.peer);
+  const callerEmail = participant?.email || incomingCall.peer;
 
-    incomingCall.on('stream', (remoteStream) => {
-      gcall.streams[callerEmail] = remoteStream;
-      if (!gcall.peers[callerEmail]) gcall.peers[callerEmail] = incomingCall;
+  incomingCall.on('stream', (remoteStream) => {
+    gcall.streams[callerEmail] = remoteStream;
+    if (!gcall.peers[callerEmail]) gcall.peers[callerEmail] = incomingCall;
 
-      // ✅ Mark connected only when stream actually arrives
-      const p = gcall.participants.find(x => x.email === callerEmail);
-      if (p) {
-        p.connected = true;
-      } else {
-        // Fallback: participant wasn't pre-added, add them now
-        gcall.participants.push({ email: callerEmail, peerId: incomingCall.peer, connected: true });
-      }
+    // ✅ Mark connected only when stream actually arrives
+    const p = gcall.participants.find(x => x.email === callerEmail);
+    if (p) {
+      p.connected = true;
+    } else {
+      gcall.participants.push({ email: callerEmail, peerId: incomingCall.peer, connected: true });
+    }
 
-      updateParticipantVideo(callerEmail, remoteStream);
-      renderCallGrid();
-    });
-
-    incomingCall.on('close', () => {
-      delete gcall.peers[callerEmail];
-      delete gcall.streams[callerEmail];
-      gcall.participants = gcall.participants.filter(p => p.email !== callerEmail);
-      removeParticipantTile(callerEmail);
-      renderCallGrid();
-    });
+    updateParticipantVideo(callerEmail, remoteStream);
+    renderCallGrid();
   });
+
+  incomingCall.on('close', () => {
+    delete gcall.peers[callerEmail];
+    delete gcall.streams[callerEmail];
+    gcall.participants = gcall.participants.filter(p => p.email !== callerEmail);
+    removeParticipantTile(callerEmail);
+    renderCallGrid();
+  });
+});
 }
 
 // ═══════════════════════════════════════════════════
 // SHOW / HIDE CALL UI
 // ═══════════════════════════════════════════════════
 function showGroupCallUI() {
+    const callModal = document.getElementById('call-modal');
+  if (callModal) callModal.style.display = 'none';
+
+  // ✅ Stop ringtone if it started
+  try { ringtone.pause(); ringtone.currentTime = 0; } catch(e) {}
+
+  // ✅ Clear any individual call timeout
+  if (typeof callTimeout !== 'undefined') {
+    clearTimeout(callTimeout);
+    callTimeout = null;
+  }
+
+  // ✅ Reset individual callState completely
+  if (typeof callState !== 'undefined') {
+    callState.isInCall = false;
+    callState.isIncoming = false;
+    callState.isOutgoing = false;
+    callState.incomingCall = null;
+    callState.callEnded = false;
+  }
+
   const overlay = document.getElementById('group-call-overlay');
   overlay.classList.add('active');
   overlay.style.display = 'flex';
@@ -7836,6 +7873,7 @@ function performGCallCleanup() {
   }
 
   // ✅ Reset ALL state once, in one place
+  gcall.isStarting = false; 
   gcall.callId = null;
   gcall.groupId = null;
   gcall.isHost = false;
